@@ -21,6 +21,7 @@ This package contains a **high-performance, columnar, in-memory storage engine**
 - Support for **SIMD-enabled filtering** (i.e. "where" clause) by leveraging [bitmap indexing](https://github.com/kelindar/bitmap).
 - Support for **columnar projection** (i.e. "select" clause) for fast retrieval.
 - Support for **computed indexes** that are dynamically calculated based on provided predicate.
+- Support for **materialized group views** maintaining per-group "sum" and "count" incrementally.
 - Support for **concurrent updates** using sharded latches to keep things fast.
 - Support for **transaction isolation**, allowing you to create transactions and commit/rollback.
 - Support for **expiration** of rows based on time-to-live or expiration column.
@@ -37,6 +38,7 @@ The general idea is to leverage cache-friendly ways of organizing data in [struc
 - [Querying and Indexing](#querying-and-indexing)
 - [Iterating over Results](#iterating-over-results)
 - [Updating Values](#updating-values)
+- [Grouped Aggregates](#grouped-aggregates)
 - [Expiring Values](#expiring-values)
 - [Transaction Commit and Rollback](#transaction-commit-and-rollback)
 - [Using Primary Keys](#using-primary-keys)
@@ -286,6 +288,42 @@ db.QueryAt(0, func(r column.Row) error {
 	r.MergeString("alphabet", "B") // now contains "A, B"
 	return nil
 })
+```
+
+## Grouped Aggregates
+
+Operational reports tend to query the same per-group totals over and over. Instead of scanning the whole collection on every read, you can materialize a _group view_ which maintains per-group aggregates incrementally as rows are committed. A view is configured with a key function that derives the group key from one or more columns, and with the aggregate columns you need (currently `sum` and `count` are supported, along with `min`/`max`).
+
+```go
+// Group the players by class and keep a running total of their balance
+stats, err := players.CreateView("by_class", func(r column.Row) string {
+	class, _ := r.String("class")
+	return class
+}, column.WithViewSum("balance"))
+
+// The view is populated from the existing rows immediately
+mages, ok := stats.Get("mage")
+fmt.Println(mages.Count, mages.Sum)
+```
+
+Once created, the view is kept in sync transactionally by every committed change, so no full scan is needed to query a group. On a commit, only the rows touched by the transaction are reconsidered and each row's contribution is recomputed from its old state and its new state. This means the maintenance is correct when a row **moves between groups** (e.g. its `class` changes): the original contribution is revoked from the old group and added to the new one, rather than being counted twice or left behind. The same applies when an aggregated value is corrected, when a row is deleted, or when it expires.
+
+```go
+// Move a player from "mage" to "rogue": "mage" loses the contribution and
+// "rogue" gains it, atomically with the commit.
+players.QueryAt(idx, func(r column.Row) error {
+	r.SetString("class", "rogue")
+	return nil
+})
+```
+
+Views are updated only for successfully committed transactions. A rolled-back transaction never affects the aggregates, and replaying the same commit twice (for example during replication) reports the same post-commit state, so it is not double-counted. A view and the main table therefore agree at the same read boundary.
+
+Just like sorted indexes, views are transient and are not part of a snapshot. After restoring a collection from a snapshot, recreate the view with `CreateView()` and it will be rebuilt from the real columns.
+
+```go
+// Remove the view, or list it with players.View("by_class")
+players.DropView("by_class")
 ```
 
 ## Expiring Values

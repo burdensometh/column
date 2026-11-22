@@ -36,6 +36,7 @@ type Collection struct {
 	pk      *columnKey         // The primary key column
 	cancel  context.CancelFunc // The cancellation function for the context
 	commits []uint64           // The array of commit IDs for corresponding chunk
+	views   []*View            // The materialized aggregate views
 }
 
 // Options represents the options for a collection.

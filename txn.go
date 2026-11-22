@@ -527,6 +527,14 @@ func (txn *Txn) commit() {
 
 	// Commit chunk by chunk to reduce lock contentions
 	txn.rangeWrite(func(commitID uint64, chunk commit.Chunk, fill bitmap.Bitmap) {
+		// Figure out which rows of this chunk are touched by this transaction,
+		// so that the materialized views can be maintained incrementally.
+		views := txn.owner.views
+		var affected bitmap.Bitmap
+		if len(views) > 0 {
+			affected = txn.affectedRows(chunk)
+		}
+
 		if changedRows {
 			txn.commitMarkers(chunk, fill, markers)
 		}
@@ -553,7 +561,44 @@ func (txn *Txn) commit() {
 				Updates: txn.updates,
 			})
 		}
+
+		// Update the materialized views from the committed state. This only
+		// runs for successfully committed transactions, hence rolled-back
+		// transactions never affect the aggregated results.
+		if len(views) > 0 && affected.Count() > 0 {
+			// Capture the post-commit state under the collection lock so the
+			// fill-list cannot change (e.g. a new index being reserved) while
+			// we iterate over it.
+			after := make([]map[uint32]viewEntry, len(views))
+			txn.owner.lock.RLock()
+			fillAfter := chunk.OfBitmap(txn.owner.fill)
+			for i, v := range views {
+				after[i] = v.capture(txn, chunk, fillAfter, affected)
+			}
+			txn.owner.lock.RUnlock()
+
+			for i, v := range views {
+				v.commit(chunk, affected, after[i])
+			}
+		}
 	})
+}
+
+// affectedRows collects the chunk-local offsets of all of the rows touched by
+// the pending transaction buffers.
+func (txn *Txn) affectedRows(chunk commit.Chunk) (affected bitmap.Bitmap) {
+	for _, u := range txn.updates {
+		if u.IsEmpty() {
+			continue
+		}
+
+		txn.reader.Range(u, chunk, func(r *commit.Reader) {
+			for r.Next() {
+				affected.Set(r.IndexAtChunk())
+			}
+		})
+	}
+	return
 }
 
 // commitUpdates applies the pending updates to the collection.
