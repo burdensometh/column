@@ -488,6 +488,25 @@ if err != nil {
 err := players.Restore(src)
 ```
 
+### Projected Snapshot
+
+When you only need to retain a subset of the data (for example, the cold rows selected by a declared visibility scope), use `SnapshotProjection()`. It exports only the rows selected by a transaction and only the explicitly named columns, while keeping the original business keys so the resulting snapshot can be restored into an independently usable collection.
+
+```go
+var dst bytes.Buffer
+
+// Export the rows selected by the transaction's filters and only two columns.
+// The primary key column is included automatically.
+err := players.SnapshotProjection(&dst, func(txn *column.Txn) error {
+    txn.WithInt("age", func(v int64) bool {
+        return v < 18 // keep only the rows in this visibility scope
+    })
+    return nil
+}, "name", "age")
+```
+
+The projected snapshot is a self-contained, restorable collection: its rows are re-indexed densely from zero (no source index is ever reused), it can be counted and searched by key after restore, and ordinary reads and writes continue to work on it. Rows inserted or deleted by concurrent transactions after the export's visibility boundary was captured are not part of the output.
+
 ## Examples
 
 Multiple complete usage examples of this library can be found in the [examples](https://github.com/kelindar/column/tree/main/examples) directory in this repository.
