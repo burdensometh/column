@@ -23,6 +23,7 @@ This package contains a **high-performance, columnar, in-memory storage engine**
 - Support for **computed indexes** that are dynamically calculated based on provided predicate.
 - Support for **concurrent updates** using sharded latches to keep things fast.
 - Support for **transaction isolation**, allowing you to create transactions and commit/rollback.
+- Optional **batch read consistency** for atomic visibility of multi-chunk commits (data and indexes share a single visibility boundary).
 - Support for **expiration** of rows based on time-to-live or expiration column.
 - Support for **atomic merging** of any values, transactionally.
 - Support for **primary keys** for use-cases where offset can't be used.
@@ -345,6 +346,21 @@ players.Query(func(txn *column.Txn) error {
 	return fmt.Errorf("bug")
 })
 ```
+
+## Batch Read Consistency
+
+Rows are organized into fixed-size storage chunks (16K rows each), and a single transaction may touch more than one chunk. By default a commit is applied **chunk by chunk**, releasing the latch of every chunk as soon as it has been applied. This keeps unrelated chunks available concurrently, but a reader whose query crosses a chunk boundary can momentarily observe the new values in an already committed chunk while the remaining chunks still expose the previous version — including the bitmap indexes, which are updated together with their data columns.
+
+If a bulk update must become visible atomically, create the collection with the `ReadBatch` read consistency mode. In this mode, when a transaction actually commits more than one chunk, all of the affected chunk latches are acquired before anything is applied and are only released once the entire transaction — data columns and computed indexes alike — has been committed under a single commit ID. A reader going through the standard `Query` path then sees either the complete previous version or the complete new version, regardless of the order in which it traverses the chunks. A failed transaction keeps the previous version because the rollback happens before any latch is acquired.
+
+```go
+// Multi-chunk commits in this collection present a single visibility boundary
+players := column.NewCollection(column.Options{
+	ReadConsistency: column.ReadBatch,
+})
+```
+
+The default `ReadChunked` mode is unchanged, so existing collections keep the lower-contention, per-chunk commit behavior. Note that readers block for the duration of an in-flight multi-chunk batch commit, so the mode is best reserved for collections that actually require atomic bulk visibility rather than enabled unconditionally.
 
 ## Using Primary Keys
 

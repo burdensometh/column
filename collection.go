@@ -38,11 +38,34 @@ type Collection struct {
 	commits []uint64           // The array of commit IDs for corresponding chunk
 }
 
+// ReadConsistency selects the visibility boundary used when a transaction
+// applies changes that span more than one storage chunk.
+type ReadConsistency uint8
+
+const (
+	// ReadChunked is the default mode. A multi-chunk transaction is committed
+	// chunk by chunk, releasing the latch of every chunk as soon as it has been
+	// applied. A concurrent reader whose scan crosses a chunk boundary can
+	// therefore observe some chunks already carrying the new values while the
+	// remaining chunks still expose the previous version.
+	ReadChunked ReadConsistency = 0
+
+	// ReadBatch makes multi-chunk commits atomic with respect to readers. All
+	// of the dirty chunks are latched before any of them is applied and the
+	// latches are only released once the whole transaction (both the data and
+	// its computed indexes) has been committed. A reader using the standard
+	// Query path then observes either the complete previous version or the
+	// complete new version regardless of the traversal order. Readers in this
+	// mode may block for the duration of a multi-chunk commit.
+	ReadBatch ReadConsistency = 1
+)
+
 // Options represents the options for a collection.
 type Options struct {
-	Capacity int           // The initial capacity when creating columns
-	Writer   commit.Logger // The writer for the commit log (optional)
-	Vacuum   time.Duration // The interval at which the vacuum of expired entries will be done
+	Capacity        int             // The initial capacity when creating columns
+	Writer          commit.Logger   // The writer for the commit log (optional)
+	Vacuum          time.Duration   // The interval at which the vacuum of expired entries will be done
+	ReadConsistency ReadConsistency // The read consistency mode used by multi-chunk commits
 }
 
 // NewCollection creates a new columnar collection.
@@ -63,6 +86,9 @@ func NewCollection(opts ...Options) *Collection {
 		}
 		if o.Writer != nil {
 			options.Writer = o.Writer
+		}
+		if o.ReadConsistency != ReadChunked {
+			options.ReadConsistency = o.ReadConsistency
 		}
 	}
 
@@ -368,6 +394,12 @@ func (c *Collection) Query(fn func(txn *Txn) error) error {
 	txn.commit()
 	c.txns.release(txn)
 	return nil
+}
+
+// batchReads reports whether multi-chunk commits must present a single,
+// transaction-wide visibility boundary to concurrent readers.
+func (c *Collection) batchReads() bool {
+	return c.opts.ReadConsistency == ReadBatch
 }
 
 // Close closes the collection and clears up all of the resources.

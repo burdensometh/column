@@ -525,8 +525,17 @@ func (txn *Txn) commit() {
 		txn.commitCapacity(commit.Chunk(last))
 	}
 
+	// Commit the transaction. In the default chunked mode each dirty chunk is
+	// latched and released independently; in batch read consistency mode all
+	// of the dirty chunks are latched first, yielding a single visibility
+	// boundary for the whole transaction.
+	commitRange := txn.rangeWrite
+	if txn.owner.batchReads() {
+		commitRange = txn.rangeWriteBatch
+	}
+
 	// Commit chunk by chunk to reduce lock contentions
-	txn.rangeWrite(func(commitID uint64, chunk commit.Chunk, fill bitmap.Bitmap) {
+	commitRange(func(commitID uint64, chunk commit.Chunk, fill bitmap.Bitmap) {
 		if changedRows {
 			txn.commitMarkers(chunk, fill, markers)
 		}
