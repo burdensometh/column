@@ -180,8 +180,15 @@ type columnSortIndex struct {
 
 // newSortIndex creates a new bitmap index column.
 func newSortIndex(indexName, columnName string) *column {
+	// Order by the sort key first and use the stable row number as a
+	// tie-breaker. This gives the tree a total order even when several
+	// rows share the same key, so each row keeps its own index entry and
+	// a Set/Delete can only ever replace or remove that single row.
 	byKeys := func(a, b sortIndexItem) bool {
-		return a.Key < b.Key
+		if a.Key != b.Key {
+			return a.Key < b.Key
+		}
+		return a.Value < b.Value
 	}
 	return columnFor(indexName, &columnSortIndex{
 		btree:   btree.NewBTreeG(byKeys),
@@ -209,6 +216,9 @@ func (c *columnSortIndex) Apply(chunk commit.Chunk, r *commit.Reader) {
 		c.backLock.Lock()
 		switch r.Type {
 		case commit.Put:
+			// Replace only this row's entry. The row number tie-breaker in the
+			// tree ordering guarantees the delete/set target this exact row,
+			// leaving the entries of any other rows sharing the same key intact.
 			if delKey, exists := c.backMap[r.Index()]; exists {
 				c.btree.Delete(sortIndexItem{
 					Key:   delKey,
@@ -222,11 +232,16 @@ func (c *columnSortIndex) Apply(chunk commit.Chunk, r *commit.Reader) {
 				Value: r.Index(),
 			})
 		case commit.Delete:
-			delKey, _ := c.backMap[r.Index()]
-			c.btree.Delete(sortIndexItem{
-				Key:   delKey,
-				Value: r.Index(),
-			})
+			// Remove only this row's entry; same-named rows stay indexed and
+			// queryable. The back-map entry is dropped as well so a later
+			// insert that reuses the row offset starts from a clean state.
+			if delKey, exists := c.backMap[r.Index()]; exists {
+				c.btree.Delete(sortIndexItem{
+					Key:   delKey,
+					Value: r.Index(),
+				})
+				delete(c.backMap, r.Index())
+			}
 		}
 		c.backLock.Unlock()
 	}
