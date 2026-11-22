@@ -499,6 +499,22 @@ func (txn *Txn) DeleteKey(key string) error {
 // a transaction in order to perform partial rollbacks.
 func (txn *Txn) rollback() {
 	txn.owner.lock.Lock()
+
+	// Free the slots that were reserved by pending inserts so they can be
+	// re-used. This also bumps their generation, hence no handle is ever
+	// published for a rolled-back insert.
+	if markers, ok := txn.findMarkers(); ok {
+		markers.RangeChunks(func(chunk commit.Chunk) {
+			txn.reader.Range(markers, chunk, func(r *commit.Reader) {
+				for r.Next() {
+					if r.Type == commit.Insert {
+						txn.owner.freeLocked(r.Index())
+					}
+				}
+			})
+		})
+	}
+
 	atomic.StoreUint64(&txn.owner.count, uint64(txn.owner.fill.Count()))
 	txn.owner.lock.Unlock()
 
@@ -597,7 +613,7 @@ func (txn *Txn) commitMarkers(chunk commit.Chunk, fill bitmap.Bitmap, buffer *co
 			case commit.Insert:
 				txn.owner.fill.Set(r.Index())
 			case commit.Delete:
-				txn.owner.fill.Remove(r.Index())
+				txn.owner.freeLocked(r.Index())
 			}
 		}
 		txn.owner.lock.Unlock()
@@ -632,6 +648,7 @@ func (txn *Txn) commitCapacity(last commit.Chunk) {
 	// Grow the fill list and all of the owner's columns
 	max := last.Max()
 	txn.owner.fill.Grow(max)
+	txn.owner.growGensLocked(max)
 	txn.owner.cols.Range(func(column *column) {
 		column.Grow(max)
 	})

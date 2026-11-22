@@ -40,6 +40,7 @@ The general idea is to leverage cache-friendly ways of organizing data in [struc
 - [Expiring Values](#expiring-values)
 - [Transaction Commit and Rollback](#transaction-commit-and-rollback)
 - [Using Primary Keys](#using-primary-keys)
+- [Versioned Row Handles](#versioned-row-handles)
 - [Storing Binary Records](#storing-binary-records)
 - [Streaming Changes](#streaming-changes)
 - [Snapshot and Restore](#snapshot-and-restore)
@@ -370,6 +371,43 @@ players.QueryKey("merlin", func(r column.Row) error {
 	class, _ := r.String("class")
 	return nil
 })
+```
+
+## Versioned Row Handles
+
+Batch loads typically delete old rows and re-use their slots, so a row index (`uint32`) saved by an external system may silently point at a completely different row after the next load. To make row references safe to hold onto, the collection can optionally hand out **versioned handles**. A `Handle` packs the row index together with the *generation* of its slot, and the generation is checked every time the handle is used.
+
+Handles are published only for committed rows: `InsertHandle()` returns the handle of a row once its transaction is committed, and a rolled-back transaction never publishes one.
+
+```go
+// Insert a row and get its versioned handle
+handle, err := players.InsertHandle(func(r column.Row) error {
+	r.SetString("name", "merlin")
+	r.SetString("class", "mage")
+	return nil
+})
+```
+
+The handle can then be stored by an external system and used later to query, update or delete the row. Before the operation is applied, the collection verifies that the handle's generation still matches the slot - if the row was deleted in the meantime (and its slot possibly re-used by another row), the stale handle is rejected with `ErrInvalidHandle` instead of touching the wrong row.
+
+```go
+// Query or update the row by its handle
+err := players.QueryHandle(handle, func(r column.Row) error {
+	r.SetString("class", "sorcerer")
+	return nil
+})
+
+// Delete the row by its handle, returns false if the handle is stale
+deleted := players.DeleteHandle(handle)
+```
+
+Once a row is deleted, its handle is permanently invalidated and will never match a different row that later re-uses the same slot. Handles also survive snapshotting: after a `Snapshot()`/`Restore()` round-trip, previously issued handles keep matching the same rows and stale handles stay invalid. If you only have a numeric index at hand, you can mint a handle for it with `HandleAt()`, and the original index-based methods (`Insert()`, `QueryAt()`, `DeleteAt()`, ...) keep working as before.
+
+```go
+// Mint a handle for an existing row index
+if handle, ok := players.HandleAt(index); ok {
+	// store handle somewhere safe
+}
 ```
 
 ## Storing Binary Records

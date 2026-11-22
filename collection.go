@@ -30,6 +30,7 @@ type Collection struct {
 	slock   *smutex.SMutex128  // The sharded mutex for the collection
 	cols    columns            // The map of columns
 	fill    bitmap.Bitmap      // The fill-list
+	gens    []uint32           // The generation of each slot, for versioned handles
 	opts    Options            // The options configured
 	logger  commit.Logger      // The commit logger for CDC
 	record  *commit.Log        // The commit logger for snapshot
@@ -74,6 +75,7 @@ func NewCollection(opts ...Options) *Collection {
 		opts:   options,
 		slock:  new(smutex.SMutex128),
 		fill:   make(bitmap.Bitmap, 0, options.Capacity>>6),
+		gens:   make([]uint32, 0, options.Capacity),
 		logger: options.Writer,
 		cancel: cancel,
 	}
@@ -89,6 +91,7 @@ func (c *Collection) next() uint32 {
 	c.lock.Lock()
 	idx := c.findFreeIndex(atomic.AddUint64(&c.count, 1))
 	c.fill.Set(idx)
+	c.growGensLocked(idx)
 	c.lock.Unlock()
 	return idx
 }
@@ -96,7 +99,7 @@ func (c *Collection) next() uint32 {
 // free marks the index as free, atomically.
 func (c *Collection) free(idx uint32) {
 	c.lock.Lock()
-	c.fill.Remove(idx)
+	c.freeLocked(idx)
 	atomic.StoreUint64(&c.count, uint64(c.fill.Count()))
 	c.lock.Unlock()
 	return
