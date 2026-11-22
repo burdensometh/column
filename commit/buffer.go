@@ -18,6 +18,13 @@ const (
 	size8    = 3 << 4 // 8 bytes in size
 	isNext   = 1 << 7 // is immediate next
 	isString = 1 << 6 // is variable-size string
+
+	// scaleMarkerPrefix and scaleMarkerOp mark the head of a fixed-point
+	// decimal column buffer. The byte following the prefix carries the column
+	// scale (number of decimal digits). The marker is a zero-value operation
+	// (Skip) and never advances the row offset.
+	scaleMarkerPrefix byte = 0x44 // 0b01000100: size0, not isNext, not isString, op == Skip
+	scaleMarkerLength      = 2    // prefix byte + scale byte
 )
 
 // --------------------------- Operation Type ----------------------------
@@ -104,6 +111,29 @@ func (b *Buffer) Reset(column string) {
 	b.buffer = b.buffer[:0]
 	b.chunks = b.chunks[:0]
 	b.Column = column
+}
+
+// PutScaleMarker writes a fixed-point scale marker at the head of the buffer.
+// A buffer carries at most one marker, so repeated calls are no-ops. The marker
+// records the scaling definition (the number of decimal digits) of the
+// fixed-point decimal column that owns this buffer, so snapshots and the
+// commit log remain self-describing.
+func (b *Buffer) PutScaleMarker(scale uint8) {
+	if len(b.buffer) >= scaleMarkerLength && b.buffer[0] == scaleMarkerPrefix {
+		return // The marker is already present
+	}
+
+	b.buffer = append(b.buffer, scaleMarkerPrefix, byte(scale))
+}
+
+// ScaleMarker reads the fixed-point scale marker from the head of the buffer.
+// It returns the scale and true when the buffer belongs to a fixed-point
+// decimal column, and zero and false for any other column.
+func (b *Buffer) ScaleMarker() (scale uint8, ok bool) {
+	if len(b.buffer) >= scaleMarkerLength && b.buffer[0] == scaleMarkerPrefix {
+		return b.buffer[1], true
+	}
+	return 0, false
 }
 
 // IsEmpty returns whether the buffer is empty or not.

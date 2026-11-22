@@ -80,9 +80,7 @@ var (
 	ForBool    = makeBools
 	ForEnum    = makeEnum
 	ForKey     = makeKey
-)
-
-// ForKind creates a new column instance for a specified reflect.Kind
+)// ForKind creates a new column instance for a specified reflect.Kind
 func ForKind(kind reflect.Kind) (Column, error) {
 	switch kind {
 	case reflect.Float32:

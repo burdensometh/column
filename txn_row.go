@@ -172,6 +172,41 @@ func (r Row) MergeFloat64(columnName string, value float64) {
 	r.txn.Float64(columnName).Merge(value)
 }
 
+// --------------------------- Fixed-Point Decimals ----------------------------
+
+// Decimal loads an exact fixed-point value at a particular column. The second
+// return value distinguishes a legitimate stored zero from a missing value.
+func (r Row) Decimal(columnName string) (Decimal, bool) {
+	return r.txn.Decimal(columnName).Get()
+}
+
+// SetDecimal stores an exact fixed-point value at a particular column,
+// validating its scale against the column's declared scaling.
+func (r Row) SetDecimal(columnName string, value Decimal) error {
+	return r.txn.Decimal(columnName).Set(value)
+}
+
+// SetDecimalText parses and stores an exact decimal text value.
+func (r Row) SetDecimalText(columnName string, value string) error {
+	return r.txn.Decimal(columnName).SetText(value)
+}
+
+// SetDecimalFloat64 converts and stores a float64 under the column's policies.
+func (r Row) SetDecimalFloat64(columnName string, value float64) error {
+	return r.txn.Decimal(columnName).SetFloat64(value)
+}
+
+// MergeDecimal atomically merges an already-scaled fixed-point delta.
+func (r Row) MergeDecimal(columnName string, delta Decimal) error {
+	return r.txn.Decimal(columnName).Merge(delta)
+}
+
+// MergeDecimalFloat64 atomically merges a float64 delta parsed exactly under
+// the column's policies.
+func (r Row) MergeDecimalFloat64(columnName string, delta float64) error {
+	return r.txn.Decimal(columnName).MergeFloat64(delta)
+}
+
 // --------------------------- Strings ----------------------------
 
 // Key loads a primary key value at a particular column

@@ -20,6 +20,7 @@ type Reader struct {
 	x0, x1     uint32  // The lower and upper bounds of the underlying buffer
 	headString int     // The starting position of a string value
 	parent     *Buffer // The parent buffer
+	scale      uint8   // The fixed-point scale of the underlying column
 }
 
 // NewReader creates a new reader for a commit log.
@@ -30,6 +31,7 @@ func NewReader() *Reader {
 // Seek resets the reader so it can be reused.
 func (r *Reader) Seek(b *Buffer) {
 	r.parent = b
+	r.scale, _ = b.ScaleMarker()
 	r.use(b.buffer)
 }
 
@@ -37,6 +39,12 @@ func (r *Reader) Seek(b *Buffer) {
 func (r *Reader) Rewind() {
 	r.use(r.buffer)
 	r.Offset = r.start
+}
+
+// Scale returns the fixed-point scale of the column this reader is attached
+// to, or zero if the column is not a fixed-point decimal column.
+func (r *Reader) Scale() uint8 {
+	return r.scale
 }
 
 // use sets the buffer and resets the reader.
@@ -133,13 +141,22 @@ func (r *Reader) Uint() uint {
 	}
 }
 
-// Float reads a floating-point value of any size.
+// Float reads a floating-point value of any size. On a fixed-point decimal
+// column buffer it converts the unscaled integer back to a scaled float64
+// using the column's scale marker; on ordinary numeric buffers it decodes the
+// raw IEEE-754 value.
 func (r *Reader) Float() float64 {
 	switch r.i1 - r.i0 {
 	case 4:
 		return float64(r.Float32())
 	case 8:
-		return r.Float64()
+		v := r.Float64()
+		if r.scale == 0 {
+			return v
+		}
+
+		// Fixed-point decimal: the stored value is an unscaled integer
+		return float64(int64(binary.BigEndian.Uint64(r.buffer[r.i0:r.i1]))) / pow10(r.scale)
 	default:
 		panic("column: unable to read, unsupported float size")
 	}
@@ -297,6 +314,7 @@ func (r *Reader) Range(buf *Buffer, chunk Chunk, fn func(*Reader)) {
 
 		// Set the reader to the subset buffer and call the delegate
 		r.use(buf.buffer[r.x0:r.x1])
+		r.scale, _ = buf.ScaleMarker()
 		r.parent = buf
 		r.Offset = int32(c.Value)
 		r.start = int32(c.Value)
@@ -306,9 +324,38 @@ func (r *Reader) Range(buf *Buffer, chunk Chunk, fn func(*Reader)) {
 
 // --------------------------- Next Iterator ----------------------------
 
+// pow10 returns 10^n as a float64, supporting the maximum fixed-point scale
+// of 18 decimal digits.
+func pow10(n uint8) float64 {
+	switch {
+	case n <= 0:
+		return 1
+	case n <= 9:
+		return float64(pow10Uint64[n])
+	default:
+		return float64(pow10Uint64[9]) * float64(pow10Uint64[n-9])
+	}
+}
+
+// pow10Uint64 contains 10^n for n in [0, 9].
+var pow10Uint64 = [10]uint64{
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
+}
+
 // Next reads the current operation and returns false if there is no more
 // operations in the log.
 func (r *Reader) Next() bool {
+	for r.last < len(r.buffer) {
+		// A fixed-point scale marker is metadata, not a row operation. Skip it
+		// without advancing the row offset.
+		if r.buffer[r.last] == scaleMarkerPrefix {
+			r.scale = r.buffer[r.last+1]
+			r.last += scaleMarkerLength
+			continue
+		}
+		break
+	}
+
 	if r.last >= len(r.buffer) {
 		return false
 	}

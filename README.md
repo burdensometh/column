@@ -37,6 +37,7 @@ The general idea is to leverage cache-friendly ways of organizing data in [struc
 - [Querying and Indexing](#querying-and-indexing)
 - [Iterating over Results](#iterating-over-results)
 - [Updating Values](#updating-values)
+- [Fixed-Point Decimals](#fixed-point-decimals)
 - [Expiring Values](#expiring-values)
 - [Transaction Commit and Rollback](#transaction-commit-and-rollback)
 - [Using Primary Keys](#using-primary-keys)
@@ -287,6 +288,64 @@ db.QueryAt(0, func(r column.Row) error {
 	return nil
 })
 ```
+
+## Fixed-Point Decimals
+
+Storing money or other exact quantities as `float64` accumulates rounding error over long-running merges. The library therefore ships an explicit **fixed-point decimal column** (`ForDecimal`) that stores every value as an exact unscaled `int64`. There is no binary floating-point arithmetic on the stored data, so merging a thousand times produces the same exact result as merging once.
+
+A decimal column is declared with an explicit **scale** (the number of digits after the decimal point), an optional **precision** (total significant digits, default 18), and explicit policies for excess precision and out-of-range values:
+
+- `WithPrecision(n)` bounds the representable magnitude.
+- `WithRounding(...)` — `RoundHalfUp` (default), `RoundDown` or `RoundUp` — decides what happens to extra fractional digits.
+- `WithOverflow(...)` — `OverflowPanic` (default), `OverflowSaturate` or `OverflowError` — decides what happens when a value exceeds the precision.
+
+```go
+// Currency: two decimal digits, at most 99,999,999.99, fail loudly on overflow.
+players.CreateColumn("balance", column.ForDecimal(2,
+    column.WithPrecision(10),
+    column.WithRounding(column.RoundHalfUp),
+    column.WithOverflow(column.OverflowPanic),
+))
+```
+
+Values are written and merged through the typed decimal accessor. Inputs may be exact text or a `float64`; floats are rendered through their shortest round-trip form and resolved under the column's policies, so no binary float error ever reaches storage.
+
+```go
+players.Query(func(txn *column.Txn) error {
+    balance := txn.Decimal("balance")
+    return txn.With("rogue").Range(func(i uint32) {
+        _ = balance.SetText("12.34")        // exact text input
+        _ = balance.MergeFloat64(0.50)      // exact: stored as +0.50
+    })
+})
+```
+
+The column plugs into the same query machinery as every other numeric column: it supports `WithDecimal` (exact predicate), the generic `WithFloat`/`WithInt`/`WithUint` filters, and exact aggregation. A legitimate stored zero remains distinct from a missing value (`ok == false`).
+
+```go
+players.Query(func(txn *column.Txn) error {
+    balance := txn.Decimal("balance")
+
+    // Exact fixed-point filtering and aggregation
+    rich := txn.WithDecimal("balance", func(v column.Decimal) bool {
+        return v.Unscaled >= 1_000_00 // 10,000.00 at scale 2
+    }).Count()
+
+    total := balance.Sum()             // exact int64-backed sum
+    exact := balance.SumText()         // arbitrary-precision sum as exact text
+
+    // Export-ready rendering, never scientific notation.
+    txn.Range(func(i uint32) {
+        if text, ok := balance.Text(); ok {
+            println(text) // e.g. "12.84"
+        }
+    })
+    _ = rich; _ = total; _ = exact
+    return nil
+})
+```
+
+The scale is part of the column's identity. It is written into every commit log batch and into snapshots, and restoring or replaying a batch encoded with a **different scale is rejected** — differently-scaled data can never silently be treated as the same column. Ordinary numeric columns keep their existing behavior unchanged.
 
 ## Expiring Values
 

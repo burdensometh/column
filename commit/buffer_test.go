@@ -135,7 +135,8 @@ func run(name string, b *testing.B, count int, fn func(buf *Buffer, r *Reader)) 
 }
 
 func TestSizeof(t *testing.T) {
-	assert.Equal(t, 96, int(unsafe.Sizeof(Reader{})))
+	// Reader carries an extra fixed-point scale byte (padded to the word size).
+	assert.Equal(t, 104, int(unsafe.Sizeof(Reader{})))
 	assert.Equal(t, 80, int(unsafe.Sizeof(Buffer{})))
 }
 

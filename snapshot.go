@@ -25,6 +25,22 @@ var (
 
 // Replay replays a commit on a collection, applying the changes.
 func (c *Collection) Replay(change commit.Commit) error {
+	// Refuse to treat batches encoded with a different fixed-point scaling as
+	// the same data. Each decimal buffer carries its scale marker, which is
+	// compared against the scale declared by the target column.
+	for _, update := range change.Updates {
+		if scale, ok := update.ScaleMarker(); ok {
+			column, exists := c.cols.Load(update.Column)
+			if !exists {
+				continue // Unknown columns are skipped during replay
+			}
+			if scaled, ok := column.Column.(Scaled); ok && scaled.Scale() != scale {
+				return fmt.Errorf("%w: column '%s' declared scale %d, batch scale %d",
+					errScaleMismatch, update.Column, scaled.Scale(), scale)
+			}
+		}
+	}
+
 	return c.Query(func(txn *Txn) error {
 		txn.dirty.Set(uint32(change.Chunk))
 		for i := range change.Updates {
@@ -197,9 +213,20 @@ func (c *Collection) readState(src io.Reader) (map[commit.Chunk]uint64, error) {
 					return errUnexpectedEOF
 				case err != nil:
 					return err
-				default:
-					txn.updates = append(txn.updates, buffer)
 				}
+
+				// A restored fixed-point batch must match the column's declared
+				// scaling; mixing differently-scaled batches is not allowed.
+				if scale, ok := buffer.ScaleMarker(); ok {
+					if column, exists := txn.owner.cols.Load(buffer.Column); exists {
+						if scaled, isScaled := column.Column.(Scaled); isScaled && scaled.Scale() != scale {
+							return fmt.Errorf("%w: column '%s' declared scale %d, snapshot scale %d",
+								errScaleMismatch, buffer.Column, scaled.Scale(), scale)
+						}
+					}
+				}
+
+				txn.updates = append(txn.updates, buffer)
 			}
 
 			return nil
