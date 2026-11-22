@@ -166,6 +166,15 @@ func (r *Reader) IsDelete() bool {
 	return r.Type == Delete
 }
 
+// Skip marks the current fixed-size operation as a no-op by rewriting its type
+// in-place in the underlying buffer. This allows a pending operation to be
+// cancelled while it is being applied.
+func (r *Reader) Skip() {
+	r.buffer[r.i0-1] &= 0xf0
+	r.buffer[r.i0-1] |= byte(Skip)
+	r.Type = Skip
+}
+
 // --------------------------- Value Swap ----------------------------
 
 // SwapInt16 swaps a uint16 value with a new one.

@@ -6,6 +6,9 @@ package column
 import (
 	"context"
 	"time"
+
+	"github.com/kelindar/bitmap"
+	"github.com/kelindar/column/commit"
 )
 
 // --------------------------- Expiration (Vacuum) ----------------------------
@@ -19,16 +22,92 @@ func (c *Collection) vacuum(ctx context.Context, interval time.Duration) {
 			ticker.Stop()
 			return
 		case <-ticker.C:
-			c.Query(func(txn *Txn) error {
-				ttl, now := txn.TTL(), time.Now()
-				return txn.With(expireColumn).Range(func(idx uint32) {
-					if expiresAt, ok := ttl.ExpiresAt(); ok && now.After(expiresAt) {
-						txn.DeleteAt(idx)
-					}
-				})
-			})
+			c.expire()
 		}
 	}
+}
+
+// expire scans the collection for rows that have expired as of the read
+// timestamp and physically deletes them. Every delete is re-validated at
+// commit time, so rows whose time-to-live was renewed after the scan are
+// not reclaimed based on a stale read.
+func (c *Collection) expire() error {
+	return c.Query(func(txn *Txn) error {
+		txn.initialize()
+		txn.expired.Range(func(idx uint32) {
+			txn.deleteExpired(idx)
+		})
+		return nil
+	})
+}
+
+// --------------------------- Expiration (Filter) ----------------------------
+
+// isExpired reports whether the given expiration time (unix nano) is expired
+// as of the given read timestamp. A zero expiration time never expires, while
+// an expiration exactly at the read timestamp is considered expired.
+func isExpired(expireAt, now int64) bool {
+	return expireAt != 0 && expireAt <= now
+}
+
+// filterExpired removes the rows that have expired as of the transaction's
+// read timestamp from the query index and collects them into the expired set.
+func (txn *Txn) filterExpired() {
+	expire, ok := txn.columnAt(expireColumn)
+	if !ok {
+		return
+	}
+
+	numeric, ok := expire.Column.(Numeric)
+	if !ok {
+		return
+	}
+
+	// Filter the query index, keeping the expired rows aside
+	now := txn.now
+	txn.rangeRead(func(chunk commit.Chunk, index bitmap.Bitmap) {
+		expire.lock.RLock()
+		defer expire.lock.RUnlock()
+
+		if numeric.Index(chunk).Count() == 0 {
+			return // No row in this chunk has an expiration set
+		}
+
+		offset := chunk.Min()
+		index.Filter(func(x uint32) bool {
+			if expireAt, ok := numeric.LoadInt64(offset + x); ok && isExpired(expireAt, now) {
+				txn.expired.Set(offset + x)
+				return false
+			}
+			return true
+		})
+	})
+}
+
+// expiredAt reports whether the row at the given index has expired as of the
+// given read timestamp. Rows without a time-to-live never expire.
+func (txn *Txn) expiredAt(idx uint32, now int64) bool {
+	expire, ok := txn.columnAt(expireColumn)
+	if !ok {
+		return false
+	}
+
+	numeric, ok := expire.Column.(Numeric)
+	if !ok {
+		return false
+	}
+
+	expire.lock.RLock()
+	expireAt, ok := numeric.LoadInt64(idx)
+	expire.lock.RUnlock()
+	return ok && isExpired(expireAt, now)
+}
+
+// deleteExpired marks the row at the given index for deletion. The delete is
+// re-validated at commit time and only applied if the row is still expired.
+func (txn *Txn) deleteExpired(idx uint32) {
+	txn.revalidate = true
+	txn.deleteAt(idx)
 }
 
 // --------------------------- Expiration (Column) ----------------------------
@@ -90,7 +169,7 @@ func writeTTL(ttl time.Duration) int64 {
 
 // TTL retrieves the time left before the row will be cleaned up
 func (r Row) TTL() (time.Duration, bool) {
-	if expireAt, ok := r.Int64(expireColumn); ok {
+	if expireAt, ok := r.Int64(expireColumn); ok && expireAt != 0 {
 		return readTTL(expireAt), true
 	}
 	return 0, false

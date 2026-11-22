@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/kelindar/bitmap"
 	"github.com/kelindar/column/commit"
@@ -32,6 +33,7 @@ func newTxnPool() *txnPool {
 			New: func() interface{} {
 				return &Txn{
 					index:   make(bitmap.Bitmap, 0, 4),
+					expired: make(bitmap.Bitmap, 0, 4),
 					dirty:   make(bitmap.Bitmap, 0, 4),
 					updates: make([]*commit.Buffer, 0, 256),
 					columns: make([]columnCache, 0, 16),
@@ -53,6 +55,7 @@ func (p *txnPool) acquire(owner *Collection) *Txn {
 	txn.owner = owner
 	txn.logger = owner.logger
 	txn.setup = false
+	txn.now = time.Now().UnixNano()
 	return txn
 }
 
@@ -78,15 +81,18 @@ func (p *txnPool) releasePage(buffer *commit.Buffer) {
 
 // Txn represents a transaction which supports filtering and projection.
 type Txn struct {
-	cursor  uint32           // The current cursor
-	setup   bool             // Whether the transaction was set up or not
-	owner   *Collection      // The target collection
-	index   bitmap.Bitmap    // The filtering index
-	dirty   bitmap.Bitmap    // The dirty chunks
-	updates []*commit.Buffer // The update buffers
-	columns []columnCache    // The column mapping
-	logger  commit.Logger    // The optional commit logger
-	reader  *commit.Reader   // The commit reader to re-use
+	cursor     uint32           // The current cursor
+	setup      bool             // Whether the transaction was set up or not
+	revalidate bool             // Whether the deletes should be re-validated at commit time
+	now        int64            // The read timestamp of the transaction (unix nano)
+	owner      *Collection      // The target collection
+	index      bitmap.Bitmap    // The filtering index
+	expired    bitmap.Bitmap    // The rows expired as of the read timestamp
+	dirty      bitmap.Bitmap    // The dirty chunks
+	updates    []*commit.Buffer // The update buffers
+	columns    []columnCache    // The column mapping
+	logger     commit.Logger    // The optional commit logger
+	reader     *commit.Reader   // The commit reader to re-use
 }
 
 // Index returns the current index
@@ -101,7 +107,9 @@ func (txn *Txn) reset() {
 	}
 
 	txn.dirty.Clear()
+	txn.expired.Clear()
 	txn.reader.Rewind()
+	txn.revalidate = false
 	txn.columns = txn.columns[:0]
 	txn.updates = txn.updates[:0]
 }
@@ -465,14 +473,21 @@ func (txn *Txn) UpsertKey(key string, fn func(Row) error) error {
 	return err
 }
 
-// QueryKey queries/updates a row given its corresponding primary key.
+// QueryKey queries/updates a row given its corresponding primary key. If the
+// row has expired as of the transaction's read timestamp, it is treated as
+// not found, even if it was not reclaimed by the vacuum yet.
 func (txn *Txn) QueryKey(key string, fn func(Row) error) error {
 	if txn.owner.pk == nil {
 		return errNoKey
 	}
 
 	if idx, ok := txn.owner.pk.OffsetOf(key); ok {
-		return txn.QueryAt(idx, fn)
+		return txn.QueryAt(idx, func(r Row) error {
+			if txn.expiredAt(idx, txn.now) {
+				return fmt.Errorf("column: key '%s' was not found", key)
+			}
+			return fn(r)
+		})
 	}
 
 	return fmt.Errorf("column: key '%s' was not found", key)
@@ -590,6 +605,14 @@ func (txn *Txn) commitUpdates(chunk commit.Chunk) (updated bool) {
 
 // commitMarkers commits inserts and deletes to the collection.
 func (txn *Txn) commitMarkers(chunk commit.Chunk, fill bitmap.Bitmap, buffer *commit.Buffer) {
+
+	// If the transaction contains expiration deletes, re-validate them against
+	// the current time so that rows renewed after the scan are not reclaimed.
+	var now int64
+	if txn.revalidate {
+		now = time.Now().UnixNano()
+	}
+
 	txn.reader.Range(buffer, chunk, func(r *commit.Reader) {
 		txn.owner.lock.Lock()
 		for r.Next() {
@@ -597,6 +620,10 @@ func (txn *Txn) commitMarkers(chunk commit.Chunk, fill bitmap.Bitmap, buffer *co
 			case commit.Insert:
 				txn.owner.fill.Set(r.Index())
 			case commit.Delete:
+				if txn.revalidate && !txn.expiredAt(r.Index(), now) {
+					r.Skip()
+					continue
+				}
 				txn.owner.fill.Remove(r.Index())
 			}
 		}

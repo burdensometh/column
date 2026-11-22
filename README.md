@@ -303,6 +303,8 @@ players.Insert(func(r column.Row) error {
 })
 ```
 
+Expired rows are hidden from queries as soon as their deadline passes, even if the periodic cleanup did not reclaim them yet. Every transaction captures a read timestamp, and rows whose expiration is at or before it are excluded from scans (`With`, `Count`, `Range`, ...) and from key lookups (`QueryKey`), all using the same expiration condition. When the cleanup goroutine physically reclaims the expired rows, it re-validates each row at commit time, so a row whose time-to-live was just renewed is never deleted based on a stale read.
+
 On an interesting note, since `expire` column which is automatically added to each collection is an actual normal column, you can query and even update it. In the example below we query and extend the time-to-live by 1 hour using the `Extend()` method.
 
 ```go

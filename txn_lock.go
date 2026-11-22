@@ -16,7 +16,8 @@ const (
 )
 
 // initialize ensures that the transaction is pre-initialized with the snapshot
-// of the owner's fill list.
+// of the owner's fill list. Rows that have expired as of the transaction's read
+// timestamp are filtered out of the snapshot, so they are invisible to the query.
 func (txn *Txn) initialize() {
 	if txn.setup {
 		return
@@ -27,6 +28,7 @@ func (txn *Txn) initialize() {
 	txn.owner.fill.Clone(&txn.index)
 	txn.owner.lock.RUnlock()
 	txn.setup = true
+	txn.filterExpired()
 }
 
 // --------------------------- Locked Seek ---------------------------
