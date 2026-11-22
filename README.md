@@ -21,6 +21,7 @@ This package contains a **high-performance, columnar, in-memory storage engine**
 - Support for **SIMD-enabled filtering** (i.e. "where" clause) by leveraging [bitmap indexing](https://github.com/kelindar/bitmap).
 - Support for **columnar projection** (i.e. "select" clause) for fast retrieval.
 - Support for **computed indexes** that are dynamically calculated based on provided predicate.
+- Support for **derived indexes** computed from multiple columns, recomputed only after all of the row's updates are applied.
 - Support for **concurrent updates** using sharded latches to keep things fast.
 - Support for **transaction isolation**, allowing you to create transactions and commit/rollback.
 - Support for **expiration** of rows based on time-to-live or expiration column.
@@ -35,6 +36,7 @@ The general idea is to leverage cache-friendly ways of organizing data in [struc
 
 - [Collection and Columns](#collection-and-columns)
 - [Querying and Indexing](#querying-and-indexing)
+- [Derived Indexes](#derived-indexes)
 - [Iterating over Results](#iterating-over-results)
 - [Updating Values](#updating-values)
 - [Expiring Values](#expiring-values)
@@ -147,6 +149,29 @@ players.Query(func(txn *column.Txn) error {
 	return nil
 })
 ```
+
+## Derived Indexes
+
+While a regular index depends on a single column, a **derived index** computes its membership from the values of _multiple columns_. This is useful when a question you often ask spans more than one field, for example "which products are in stock **and** currently sellable?". Instead of scanning two columns on every query, you declare the dependency columns once and query the resulting bitmap index with `With()`.
+
+The index declares the columns it depends on up front, and the rule is only allowed to read those columns. The membership of a row is recomputed **only after all of the updates to that row have been applied** - so if a single transaction updates both `stock` and `status`, the rule is evaluated once, with the final values of both columns. A row is a member of the index only while it exists, all of the dependent columns have a value for it and the rule evaluates to `true`. Hence, deleting a row or removing one of its dependent fields also removes it from the index.
+
+```go
+// Create the index "sellable" in advance, derived from 2 columns
+products.CreateDerivedIndex("sellable", []string{"stock", "status"}, func(r column.RowReader) bool {
+	stock, _  := r.Int("stock")
+	status, _ := r.String("status")
+	return stock > 0 && status == "sellable"
+})
+
+// This returns the same result as filtering both columns, but much faster
+products.Query(func(txn *column.Txn) error {
+	count := txn.With("sellable").Count()
+	return nil
+})
+```
+
+Just like regular indexes, derived indexes are built from the existing data when created, are skipped by snapshots and are rebuilt from the replayed data when a collection is restored or replicated, so the result of `With()` always matches filtering every row by its final values.
 
 ## Iterating over Results
 

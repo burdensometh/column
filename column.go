@@ -158,8 +158,12 @@ func columnFor(name string, v Column) *column {
 
 // IsIndex returns whether the column is an index
 func (c *column) IsIndex() bool {
-	_, ok := c.Column.(*columnIndex)
-	return ok
+	switch c.Column.(type) {
+	case *columnIndex, *columnDerivedIndex:
+		return true
+	default:
+		return false
+	}
 }
 
 // IsNumeric checks whether a column type supports certain numerical operations.

@@ -36,6 +36,7 @@ type Collection struct {
 	pk      *columnKey         // The primary key column
 	cancel  context.CancelFunc // The cancellation function for the context
 	commits []uint64           // The array of commit IDs for corresponding chunk
+	derived atomic.Value       // The derived indexes of the collection ([]*column)
 }
 
 // Options represents the options for a collection.
@@ -237,6 +238,10 @@ func (c *Collection) DropTrigger(triggerName string) error {
 		return fmt.Errorf("column: unable to drop index, '%v' is not a trigger", triggerName)
 	}
 
+	if _, ok := column.Column.(*columnDerivedIndex); ok {
+		return fmt.Errorf("column: unable to drop trigger, '%v' is a derived index, use DropIndex instead", triggerName)
+	}
+
 	// Figure out the associated column and delete the index from that
 	columnName := column.Column.(computed).Column()
 	c.cols.DeleteIndex(columnName, triggerName)
@@ -276,6 +281,70 @@ func (c *Collection) CreateIndex(indexName, columnName string, fn func(r Reader)
 			reader.Seek(buffer)
 			index.Apply(chunk, reader)
 		}
+	}
+
+	return nil
+}
+
+// CreateDerivedIndex creates a bitmap index with a specified name whose
+// membership is derived from the values of multiple columns. The rule is
+// evaluated for a row only after all of the updates to that row have been
+// applied, and a row is only a member of the index while it exists, all of
+// the dependent columns have a value for it and the rule evaluates to true.
+// Note that for boolean columns only a "true" value counts as present, which
+// is consistent with the rest of the store.
+func (c *Collection) CreateDerivedIndex(indexName string, columnNames []string, fn func(r RowReader) bool) error {
+	if fn == nil || indexName == "" || len(columnNames) == 0 {
+		return fmt.Errorf("column: create index must specify name, columns and function")
+	}
+
+	// The index must not exist yet
+	if _, ok := c.cols.Load(indexName); ok {
+		return fmt.Errorf("column: unable to create index, index '%v' already exists", indexName)
+	}
+
+	// Resolve all of the columns the index depends on, ignoring duplicates
+	seen := make(map[string]struct{}, len(columnNames))
+	deps := make([]derivedColumn, 0, len(columnNames))
+	for _, columnName := range columnNames {
+		if _, ok := seen[columnName]; ok {
+			continue
+		}
+
+		column, ok := c.cols.Load(columnName)
+		if !ok {
+			return fmt.Errorf("column: unable to create index, column '%v' does not exist", columnName)
+		}
+
+		seen[columnName] = struct{}{}
+		deps = append(deps, derivedColumn{name: columnName, col: column})
+	}
+
+	// Create and register the index column on each of its dependencies
+	index := newDerivedIndex(indexName, deps, fn)
+	c.lock.Lock()
+	index.Grow(uint32(c.opts.Capacity))
+	c.cols.Store(indexName, index)
+	for _, dep := range deps {
+		c.cols.Store(dep.name, dep.col, index)
+	}
+	c.addDerived(index)
+	c.lock.Unlock()
+
+	// Build the index from the actual existing data, chunk by chunk. First
+	// mark the rows having any of the dependent values, then recompute their
+	// membership from the final stored values of all of the dependencies.
+	chunks := c.chunks()
+	buffer := commit.NewBuffer(c.Count())
+	reader := commit.NewReader()
+	for chunk := commit.Chunk(0); int(chunk) < chunks; chunk++ {
+		for _, dep := range deps {
+			if dep.col.Snapshot(chunk, buffer) {
+				reader.Seek(buffer)
+				index.Apply(chunk, reader)
+			}
+		}
+		index.recomputeDerived(chunk, c.chunkFill(chunk))
 	}
 
 	return nil
@@ -334,10 +403,19 @@ func (c *Collection) DropIndex(indexName string) error {
 		return fmt.Errorf("column: unable to drop index, '%v' is not an index", indexName)
 	}
 
-	// Figure out the associated column and delete the index from that
-	columnName := column.Column.(computed).Column()
-	c.cols.DeleteIndex(columnName, indexName)
+	// Figure out the associated column(s) and delete the index from them
+	c.lock.Lock()
+	if multi, ok := column.Column.(interface{ Columns() []string }); ok {
+		for _, columnName := range multi.Columns() {
+			c.cols.DeleteIndex(columnName, indexName)
+		}
+		c.removeDerived(column)
+	} else {
+		columnName := column.Column.(computed).Column()
+		c.cols.DeleteIndex(columnName, indexName)
+	}
 	c.cols.DeleteColumn(indexName)
+	c.lock.Unlock()
 	return nil
 }
 
@@ -547,4 +625,55 @@ func (c *columns) DeleteIndex(columnName, indexName string) {
 	}
 
 	c.cols.Store(columns)
+}
+
+// --------------------------- derived index registry ---------------------------
+
+// loadDerived loads the registered derived index columns.
+func (c *Collection) loadDerived() []*column {
+	if v := c.derived.Load(); v != nil {
+		return v.([]*column)
+	}
+	return nil
+}
+
+// addDerived registers a derived index column. This is not thread-safe and
+// must be called under the collection lock.
+func (c *Collection) addDerived(index *column) {
+	derived := c.loadDerived()
+	updated := make([]*column, len(derived)+1)
+	copy(updated, derived)
+	updated[len(derived)] = index
+	c.derived.Store(updated)
+}
+
+// removeDerived unregisters a derived index column. This is not thread-safe
+// and must be called under the collection lock.
+func (c *Collection) removeDerived(index *column) {
+	derived := c.loadDerived()
+	updated := make([]*column, 0, len(derived))
+	for _, v := range derived {
+		if v != index {
+			updated = append(updated, v)
+		}
+	}
+	c.derived.Store(updated)
+}
+
+// recomputeDerived recomputes the membership of all of the derived indexes
+// for a given chunk. This must be called after all of the updates for the
+// chunk were applied, so that the dependent columns contain their final
+// values. The provided fill list represents the rows currently present in
+// the collection.
+func (c *Collection) recomputeDerived(chunk commit.Chunk, fill bitmap.Bitmap) {
+	for _, index := range c.loadDerived() {
+		index.recomputeDerived(chunk, fill)
+	}
+}
+
+// chunkFill returns the fill list of the collection for a given chunk.
+func (c *Collection) chunkFill(chunk commit.Chunk) bitmap.Bitmap {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return chunk.OfBitmap(c.fill)
 }

@@ -532,7 +532,7 @@ func (txn *Txn) commit() {
 		}
 
 		// Attemp to update, if nothing was changed we're done
-		updated := txn.commitUpdates(chunk)
+		updated := txn.commitUpdates(chunk, fill)
 		if !changedRows && !updated {
 			return
 		}
@@ -557,7 +557,7 @@ func (txn *Txn) commit() {
 }
 
 // commitUpdates applies the pending updates to the collection.
-func (txn *Txn) commitUpdates(chunk commit.Chunk) (updated bool) {
+func (txn *Txn) commitUpdates(chunk commit.Chunk, fill bitmap.Bitmap) (updated bool) {
 	for _, u := range txn.updates {
 		if u.IsEmpty() || u.Column == rowColumn {
 			continue // No updates for this column
@@ -585,6 +585,10 @@ func (txn *Txn) commitUpdates(chunk commit.Chunk) (updated bool) {
 			})
 		}
 	}
+
+	// Recompute the derived indexes only now, once all of the columns have
+	// reached their final state for this chunk.
+	txn.owner.recomputeDerived(chunk, fill)
 	return updated
 }
 
