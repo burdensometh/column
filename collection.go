@@ -33,6 +33,7 @@ type Collection struct {
 	opts    Options            // The options configured
 	logger  commit.Logger      // The commit logger for CDC
 	record  *commit.Log        // The commit logger for snapshot
+	subs    *subscriptions     // The committed row change subscriptions
 	pk      *columnKey         // The primary key column
 	cancel  context.CancelFunc // The cancellation function for the context
 	commits []uint64           // The array of commit IDs for corresponding chunk
@@ -75,6 +76,7 @@ func NewCollection(opts ...Options) *Collection {
 		slock:  new(smutex.SMutex128),
 		fill:   make(bitmap.Bitmap, 0, options.Capacity>>6),
 		logger: options.Writer,
+		subs:   newSubscriptions(),
 		cancel: cancel,
 	}
 

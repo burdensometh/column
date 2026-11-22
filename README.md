@@ -27,6 +27,7 @@ This package contains a **high-performance, columnar, in-memory storage engine**
 - Support for **atomic merging** of any values, transactionally.
 - Support for **primary keys** for use-cases where offset can't be used.
 - Support for **change data stream** that streams all commits consistently.
+- Support for **committed row change subscriptions** with before/after values.
 - Support for **concurrent snapshotting** allowing to store the entire collection into a file.
 
 ## Documentation
@@ -42,6 +43,7 @@ The general idea is to leverage cache-friendly ways of organizing data in [struc
 - [Using Primary Keys](#using-primary-keys)
 - [Storing Binary Records](#storing-binary-records)
 - [Streaming Changes](#streaming-changes)
+- [Subscribing to Row Changes](#subscribing-to-row-changes)
 - [Snapshot and Restore](#snapshot-and-restore)
 - [Examples](#examples)
 - [Benchmarks](#benchmarks)
@@ -459,6 +461,47 @@ go func() {
 	}
 }()
 ```
+
+## Subscribing to Row Changes
+
+While the commit log streams raw per-column operations, a subscription gives you **one complete event per logical row and commit**. When a transaction changes multiple fields of a row, all of the pending insert, update and delete operations are merged by logical row into a single `RowChange` that carries the before/after values of the declared columns together with the identity of the commit. Rolled back transactions emit no events, and consecutive `Merge()` operations on the same field surface only the final value.
+
+```go
+// Subscribe to committed row changes, declaring the columns to carry
+sub, err := players.Subscribe(column.WithColumns("name", "balance"))
+if err != nil {
+	panic(err)
+}
+defer sub.Close()
+
+// Consume the committed row changes
+for {
+	event, ok := sub.Next() // Blocks until the next committed change
+	if !ok {
+		break // Subscription closed and drained
+	}
+
+	fmt.Printf("commit=%d row=%d type=%s\n", event.Commit, event.Row, event.Type)
+	fmt.Printf("before=%v\n", event.Before) // nil for inserts
+	fmt.Printf("after=%v\n", event.After)   // nil for deletes
+}
+```
+
+Each subscription owns an **independent delivery queue**, hence a slow consumer can catch up at its own pace without affecting other consumers. Delivered events are detached copies and are never backed by internal reusable buffers, so they never change after being delivered. Two delivery modes are available:
+
+- **Independent follow-read (default)** — committing transactions never wait for the consumer; events accumulate in the subscription's own queue until consumed.
+- **Blocking (`WithBlocking()`)** — when the consumer falls behind and its queue (sized with `WithCapacity()`) is full, committing transactions wait, as declared, until the consumer catches up.
+
+```go
+// Committing transactions wait once 64 events are pending on this consumer
+sub, err := players.Subscribe(
+	column.WithColumns("balance"),
+	column.WithCapacity(64),
+	column.WithBlocking(),
+)
+```
+
+If no columns are declared via `WithColumns()`, events carry all of the data columns. Note that since `Replay()` and `Restore()` apply commits through the regular commit path, they also emit events to the subscriptions of the target collection.
 
 ## Snapshot and Restore
 

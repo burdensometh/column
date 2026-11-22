@@ -525,8 +525,19 @@ func (txn *Txn) commit() {
 		txn.commitCapacity(commit.Chunk(last))
 	}
 
+	// If there are active subscriptions, plan the row change capture
+	plan := txn.owner.subs.plan(txn.owner)
+
 	// Commit chunk by chunk to reduce lock contentions
+	var changes []RowChange
 	txn.rangeWrite(func(commitID uint64, chunk commit.Chunk, fill bitmap.Bitmap) {
+
+		// Capture the merged before-image of the changed rows, if subscribed
+		var captured *capture
+		if plan != nil {
+			captured = plan.captureBefore(txn, commitID, chunk)
+		}
+
 		if changedRows {
 			txn.commitMarkers(chunk, fill, markers)
 		}
@@ -535,6 +546,11 @@ func (txn *Txn) commit() {
 		updated := txn.commitUpdates(chunk)
 		if !changedRows && !updated {
 			return
+		}
+
+		// Capture the after-image and accumulate the merged row changes
+		if captured != nil {
+			changes = captured.finish(changes)
 		}
 
 		// If there is a pending snapshot, append commit into a temp log
@@ -554,6 +570,10 @@ func (txn *Txn) commit() {
 			})
 		}
 	})
+
+	// Deliver the committed row changes to the subscriptions. This happens
+	// after the transaction was fully committed and no chunk locks are held.
+	txn.owner.subs.dispatch(changes)
 }
 
 // commitUpdates applies the pending updates to the collection.
