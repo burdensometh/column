@@ -488,6 +488,46 @@ if err != nil {
 err := players.Restore(src)
 ```
 
+## Column Migrations
+
+Schemas evolve: a column may need to be renamed or its value type widened. Because snapshots and the incremental commit stream only carry column names (not the schema), restoring old data into a newer collection requires an explicit mapping. The `MigrateColumn()` method declares such a migration: it binds buffers written under the **old** column name and type to the column registered under the **new** name, converting every value to the new, real value type.
+
+The destination column is still created through the normal `CreateColumn()` interface — a migration never creates a column, it only tells the store how to reconcile legacy data with an existing one. In the example below an old `trade_amt` column stored as `int32` is renamed to `amount` and widened to `int64`.
+
+```go
+// Build the new schema through the existing interface.
+orders := column.NewCollection()
+orders.CreateColumn("name", column.ForString())
+orders.CreateColumn("amount", column.ForInt64())
+
+// Declare the explicit migration from the old schema.
+err := orders.MigrateColumn(column.ColumnMigration{
+    OldName: "trade_amt", // name used by old snapshots and old increments
+    NewName: "amount",    // current column name
+    OldType: column.TypeInt32,
+    NewType: column.TypeInt64,
+})
+
+// Indexes that depend on the migrated column are rebuilt from the migrated
+// values, both when restoring a snapshot and when replaying old increments.
+orders.CreateIndex("large_order", "amount", func(r column.Reader) bool {
+    return r.Int() >= 1_000_000
+})
+
+// Old snapshots and old streamed commits now restore/replay correctly.
+orders.Restore(src)
+orders.Replay(oldCommit)
+```
+
+Migrations are validated up front and the collection is left unchanged when a definition is rejected. A migration is refused when:
+
+- the target column does not exist or is itself an index;
+- the declared destination type does not match the actual column type;
+- the old name still belongs to a live column, or two migrations collide on the same source or destination name;
+- the conversion would be **lossy** (narrowing, a same-width change of signedness, integer-to-float, float narrowing, or any conversion into/from strings and records).
+
+Integer widening that can hold the entire source range (e.g. `int32` → `int64`, `uint32` → `int64`) and `float32` → `float64` are accepted. Restoring or replaying data that references an unknown column with no registered migration fails outright — legacy data is never silently discarded by renaming a column.
+
 ## Examples
 
 Multiple complete usage examples of this library can be found in the [examples](https://github.com/kelindar/column/tree/main/examples) directory in this repository.

@@ -102,6 +102,13 @@ func (r *Reader) Bytes() []byte {
 	return r.buffer[r.i0:r.i1]
 }
 
+// ValueWidth returns the on-wire width in bytes of the current value. It is 0
+// for valueless operations (insert/delete) and the encoded payload size for
+// fixed-size and variable-size values.
+func (r *Reader) ValueWidth() int {
+	return r.i1 - r.i0
+}
+
 // --------------------------- Reader Interface ----------------------------
 
 // Index returns the current index of the reader.

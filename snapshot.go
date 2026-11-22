@@ -23,15 +23,43 @@ var (
 
 // --------------------------- Commit Replay ---------------------------
 
-// Replay replays a commit on a collection, applying the changes.
+// Replay replays a commit on a collection, applying the changes. Buffers that
+// were produced under an older schema are rebound to the migrated columns and
+// their values are converted to the current, real value types. A commit that
+// references an unknown column without a registered migration is rejected in
+// full.
 func (c *Collection) Replay(change commit.Commit) error {
+	// Validate and migrate every buffer before opening the transaction, so a
+	// bad commit never leaves a partially applied change behind. Each buffer
+	// entering the transaction is an independent, pool-owned copy.
+	var updates []*commit.Buffer
+	rollback := func() {
+		for _, u := range updates {
+			c.txns.releasePage(u)
+		}
+	}
+
+	for _, buffer := range change.Updates {
+		if buffer.IsEmpty() {
+			continue
+		}
+
+		migrated, err := c.migrateBuffer(buffer)
+		if err != nil {
+			rollback()
+			return err
+		}
+
+		// A row marker passes through without a copy; it never carries values.
+		if migrated == buffer && buffer.Column != rowColumn {
+			migrated = buffer.Clone()
+		}
+		updates = append(updates, migrated)
+	}
+
 	return c.Query(func(txn *Txn) error {
 		txn.dirty.Set(uint32(change.Chunk))
-		for i := range change.Updates {
-			if !change.Updates[i].IsEmpty() {
-				txn.updates = append(txn.updates, change.Updates[i])
-			}
-		}
+		txn.updates = append(txn.updates, updates...)
 		return nil
 	})
 }
@@ -194,12 +222,29 @@ func (c *Collection) readState(src io.Reader) (map[commit.Chunk]uint64, error) {
 				_, err := buffer.ReadFrom(r)
 				switch {
 				case err == io.EOF && i < columns:
+					txn.owner.txns.releasePage(buffer)
 					return errUnexpectedEOF
 				case err != nil:
+					txn.owner.txns.releasePage(buffer)
 					return err
-				default:
-					txn.updates = append(txn.updates, buffer)
 				}
+
+				// Rebind old-schema columns to the current schema and convert
+				// their values to the real, current value types. An unknown
+				// column without a registered migration aborts the restore so
+				// data can never be silently discarded.
+				migrated, err := txn.owner.migrateBuffer(buffer)
+				if err != nil {
+					txn.owner.txns.releasePage(buffer)
+					return err
+				}
+
+				// The row marker passes through unchanged, everything else is
+				// either a clone or a converted pool-owned buffer.
+				if migrated != buffer {
+					txn.owner.txns.releasePage(buffer)
+				}
+				txn.updates = append(txn.updates, migrated)
 			}
 
 			return nil
